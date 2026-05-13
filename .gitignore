@@ -1,0 +1,12 @@
+# Build artifacts
+   Build/
+   
+   # EDK2 Configuration
+   Conf/
+   
+   # Windows junk
+   *.pdb
+   *.ncb
+   *.suo
+   .vs/
+   Thumbs.db
