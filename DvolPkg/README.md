@@ -30,7 +30,7 @@ DvolPkg provides two ways to use the `dvol` utility:
 build -p DvolPkg\DvolPkg.dsc -a X64 -t VS2022 -b RELEASE
 ```
 
-Output: `Build/DvolPkg/RELEASE_VS2022/X64/DvolPkg/Application/DvolApp/DvolApp/OUTPUT/dvol.efi`
+Output: `Build/DvolPkg/RELEASE_VS2022/X64/DvolPkg/Application/DvolApp/DvolApp/OUTPUT/DvolApp.efi`
 
 ### Built-in Shell Command
 

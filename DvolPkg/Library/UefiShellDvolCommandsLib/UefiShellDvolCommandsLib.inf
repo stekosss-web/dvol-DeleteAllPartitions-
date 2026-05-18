@@ -16,14 +16,17 @@
   VERSION_STRING                 = 1.0
   LIBRARY_CLASS                  = NULL|UEFI_APPLICATION
   CONSTRUCTOR                    = ShellDvolCommandsLibConstructor
+  DESTRUCTOR                     = ShellDvolCommandsLibDestructor
 
 [Sources]
   UefiShellDvolCommandsLib.c
   UefiShellDvolCommandsLib.h
+  UefiShellDvolCommandsLib.uni
   DvolCmd.c
 
 [Packages]
   MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
   ShellPkg/ShellPkg.dec
   DvolPkg/DvolPkg.dec
 
@@ -34,12 +37,14 @@
   BaseLib
   BaseMemoryLib
   DebugLib
+  HiiLib
   UefiLib
   UefiBootServicesTableLib
   UefiRuntimeServicesTableLib
   DevicePathLib
   PcdLib
   PrintLib
+  SafeIntLib
 
 [Protocols]
   gEfiShellProtocolGuid                         ## CONSUMES
@@ -58,6 +63,7 @@
   gEfiDiskInfoScsiInterfaceGuid                 ## CONSUMES
   gEfiDiskInfoUsbInterfaceGuid                  ## CONSUMES
   gEfiFileInfoGuid                              ## CONSUMES
+  gDvolShellHiiGuid                             ## SOMETIMES_CONSUMES ## HII
   gDvolPkgTokenSpaceGuid                        ## CONSUMES
 
 [Pcd]

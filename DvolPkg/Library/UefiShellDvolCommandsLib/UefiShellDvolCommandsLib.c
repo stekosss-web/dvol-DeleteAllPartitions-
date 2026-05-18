@@ -9,6 +9,19 @@
 
 #include "UefiShellDvolCommandsLib.h"
 
+STATIC CONST CHAR16  mDvolManFileName[] = L"ShellCommands";
+STATIC EFI_HII_HANDLE gDvolShellHiiHandle = NULL;
+
+STATIC
+CONST CHAR16 *
+EFIAPI
+ShellCommandGetManFileNameDvol (
+  VOID
+  )
+{
+  return mDvolManFileName;
+}
+
 /**
   Constructor for the Shell Dvol Commands library.
 
@@ -26,6 +39,13 @@ ShellDvolCommandsLibConstructor (
   IN EFI_SYSTEM_TABLE  *SystemTable
   )
 {
+  (VOID)SystemTable;
+
+  gDvolShellHiiHandle = HiiAddPackages (&gDvolShellHiiGuid, ImageHandle, UefiShellDvolCommandsLibStrings, NULL);
+  if (gDvolShellHiiHandle == NULL) {
+    return EFI_DEVICE_ERROR;
+  }
+
   //
   // Register the 'dvol' command. 
   // Level 0 means it is available at any shell support level.
@@ -33,13 +53,31 @@ ShellDvolCommandsLibConstructor (
   ShellCommandRegisterCommandName (
     L"dvol",
     ShellCommandRunDvol,
-    NULL,   // No specific help file needed in this minimal setup
+    ShellCommandGetManFileNameDvol,
     0,      // Available at any level
     L"",
     TRUE,   // Can affect LastError
-    NULL,   // No HII handle
-    0       // No HII string ID
+    gDvolShellHiiHandle,
+    STRING_TOKEN (STR_GET_HELP_DVOL)
     );
+
+  return EFI_SUCCESS;
+}
+
+EFI_STATUS
+EFIAPI
+ShellDvolCommandsLibDestructor (
+  IN EFI_HANDLE        ImageHandle,
+  IN EFI_SYSTEM_TABLE  *SystemTable
+  )
+{
+  (VOID)ImageHandle;
+  (VOID)SystemTable;
+
+  if (gDvolShellHiiHandle != NULL) {
+    HiiRemovePackages (gDvolShellHiiHandle);
+    gDvolShellHiiHandle = NULL;
+  }
 
   return EFI_SUCCESS;
 }

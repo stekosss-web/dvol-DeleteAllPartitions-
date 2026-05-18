@@ -17,6 +17,7 @@
 #include <Guid/FileInfo.h>
 #include <Library/DevicePathLib.h>
 #include <Library/PrintLib.h>
+#include <Library/SafeIntLib.h>
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -93,7 +94,28 @@ typedef struct {
 // Global Log State
 // ---------------------------------------------------------------------------
 
-static EFI_FILE_PROTOCOL *mLogFile = NULL;
+static SHELL_FILE_HANDLE  mLogFile = NULL;
+
+STATIC
+VOID
+LogFileWrite (
+  IN CONST VOID  *Buffer,
+  IN UINTN       Size
+  )
+{
+  EFI_STATUS  Status;
+  UINTN       WriteSize;
+
+  if ((mLogFile == NULL) || (Buffer == NULL) || (Size == 0)) {
+    return;
+  }
+
+  WriteSize = Size;
+  Status    = ShellWriteFile (mLogFile, &WriteSize, (VOID *)Buffer);
+  if (EFI_ERROR (Status) || (WriteSize != Size)) {
+    ShellCloseFile (&mLogFile);
+  }
+}
 
 STATIC
 VOID
@@ -102,10 +124,7 @@ LogWrite (
   )
 {
   ShellPrintEx (-1, -1, L"%s", Str);
-  if (mLogFile != NULL) {
-    UINTN Size = StrLen (Str) * sizeof (CHAR16);
-    mLogFile->Write (mLogFile, &Size, (VOID *)Str);
-  }
+  LogFileWrite (Str, StrLen (Str) * sizeof (CHAR16));
 }
 
 STATIC
@@ -114,14 +133,11 @@ LogWriteCrLf (
   IN CONST CHAR16 *Str
   )
 {
+  CONST CHAR16  CrLf[] = L"\r\n";
+
   ShellPrintEx (-1, -1, L"%s\r\n", Str);
-  if (mLogFile != NULL) {
-    UINTN Size = StrLen (Str) * sizeof (CHAR16);
-    mLogFile->Write (mLogFile, &Size, (VOID *)Str);
-    Size = sizeof (CHAR16);
-    CHAR16 CrLf[] = L"\r\n";
-    mLogFile->Write (mLogFile, &Size, CrLf);
-  }
+  LogFileWrite (Str, StrLen (Str) * sizeof (CHAR16));
+  LogFileWrite (CrLf, StrLen (CrLf) * sizeof (CHAR16));
 }
 
 STATIC
@@ -139,10 +155,7 @@ LogPrintf (
   VA_END (Args);
 
   ShellPrintEx (-1, -1, L"%s", Buffer);
-  if (mLogFile != NULL) {
-    UINTN Size = StrLen (Buffer) * sizeof (CHAR16);
-    mLogFile->Write (mLogFile, &Size, Buffer);
-  }
+  LogFileWrite (Buffer, StrLen (Buffer) * sizeof (CHAR16));
 }
 
 STATIC
@@ -151,49 +164,24 @@ OpenLogFile (
   IN CONST CHAR16 *Path
   )
 {
-  EFI_STATUS                             Status;
-  EFI_HANDLE                             *FsHandles;
-  UINTN                                  FsHandleCount;
-  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL        *Fs;
-  EFI_FILE_PROTOCOL                      *Root;
+  EFI_STATUS  Status;
+  CHAR16      Bom;
 
   if (StrLen (Path) == 0) {
     return EFI_INVALID_PARAMETER;
   }
 
-  Status = gBS->LocateHandleBuffer (
-                  ByProtocol,
-                  &gEfiSimpleFileSystemProtocolGuid,
-                  NULL,
-                  &FsHandleCount,
-                  &FsHandles
-                  );
-  if (EFI_ERROR (Status) || FsHandleCount == 0) {
-    return EFI_NOT_FOUND;
-  }
-
-  Fs = NULL;
-  Status = gBS->HandleProtocol (FsHandles[0], &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs);
-  if (EFI_ERROR (Status)) {
-    FreePool (FsHandles);
-    return Status;
-  }
-
-  Status = Fs->OpenVolume (Fs, &Root);
-  if (EFI_ERROR (Status)) {
-    FreePool (FsHandles);
-    return Status;
-  }
-
-  Status = Root->Open (Root, &mLogFile, (CHAR16 *)Path, EFI_FILE_MODE_CREATE | EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
+  Status = ShellOpenFileByName (
+             Path,
+             &mLogFile,
+             EFI_FILE_MODE_CREATE | EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE,
+             0
+             );
   if (!EFI_ERROR (Status)) {
-    UINTN BomSize = sizeof (CHAR16);
-    CHAR16 BOM = 0xFEFF;
-    mLogFile->Write (mLogFile, &BomSize, &BOM);
+    Bom = 0xFEFF;
+    LogFileWrite (&Bom, sizeof (Bom));
   }
 
-  Root->Close (Root);
-  FreePool (FsHandles);
   return Status;
 }
 
@@ -204,8 +192,8 @@ CloseLogFile (
   )
 {
   if (mLogFile != NULL) {
-    mLogFile->Close (mLogFile);
-    mLogFile = NULL;
+    ShellFlushFile (mLogFile);
+    ShellCloseFile (&mLogFile);
   }
 }
 
@@ -223,16 +211,187 @@ IsRemovableDevice (
 }
 
 STATIC
+BOOLEAN
+IsWholeDiskDevice (
+  IN EFI_BLOCK_IO_PROTOCOL  *BlockIo
+  )
+{
+  if ((BlockIo == NULL) || (BlockIo->Media == NULL)) {
+    return FALSE;
+  }
+
+  return (BOOLEAN)(
+           !BlockIo->Media->LogicalPartition &&
+           BlockIo->Media->MediaPresent &&
+           (BlockIo->Media->BlockSize >= sizeof (MBR_TABLE))
+           );
+}
+
+STATIC
+BOOLEAN
+GetGptEntryLayout (
+  IN  EFI_BLOCK_IO_PROTOCOL            *BlockIo,
+  IN  CONST EFI_PARTITION_TABLE_HEADER *Header,
+  OUT UINTN                            *EntriesSize,
+  OUT UINTN                            *EntrySpanSize,
+  OUT EFI_LBA                          *BackupEntryLba
+  )
+{
+  RETURN_STATUS  SafeStatus;
+  UINTN          BlockSize;
+  UINTN          RoundedSize;
+  EFI_LBA        EntryBlocks;
+
+  if ((BlockIo == NULL) || (BlockIo->Media == NULL) || (Header == NULL) ||
+      (EntriesSize == NULL) || (EntrySpanSize == NULL) || (BackupEntryLba == NULL))
+  {
+    return FALSE;
+  }
+
+  BlockSize = (UINTN)BlockIo->Media->BlockSize;
+  if ((Header->Header.Signature != EFI_PTAB_HEADER_ID) ||
+      (Header->MyLBA != PRIMARY_PART_HEADER_LBA) ||
+      (Header->Header.HeaderSize < sizeof (EFI_PARTITION_TABLE_HEADER)) ||
+      (Header->Header.HeaderSize > BlockSize) ||
+      (Header->FirstUsableLBA > Header->LastUsableLBA) ||
+      (Header->PartitionEntryLBA < 2) ||
+      (Header->PartitionEntryLBA > BlockIo->Media->LastBlock) ||
+      (Header->AlternateLBA == 0) ||
+      (Header->AlternateLBA > BlockIo->Media->LastBlock) ||
+      (Header->NumberOfPartitionEntries == 0) ||
+      (Header->SizeOfPartitionEntry < sizeof (EFI_PARTITION_ENTRY)) ||
+      ((Header->SizeOfPartitionEntry % sizeof (EFI_PARTITION_ENTRY)) != 0))
+  {
+    return FALSE;
+  }
+
+  SafeStatus = SafeUintnMult (
+                 (UINTN)Header->NumberOfPartitionEntries,
+                 (UINTN)Header->SizeOfPartitionEntry,
+                 EntriesSize
+                 );
+  if (RETURN_ERROR (SafeStatus) || (*EntriesSize == 0) || (*EntriesSize > MAX_GPT_ENTRIES_SIZE)) {
+    return FALSE;
+  }
+
+  SafeStatus = SafeUintnAdd (*EntriesSize, BlockSize - 1, &RoundedSize);
+  if (RETURN_ERROR (SafeStatus)) {
+    return FALSE;
+  }
+
+  EntryBlocks = (EFI_LBA)(RoundedSize / BlockSize);
+  if ((EntryBlocks == 0) ||
+      ((EntryBlocks - 1) > BlockIo->Media->LastBlock) ||
+      (Header->PartitionEntryLBA > (BlockIo->Media->LastBlock - (EntryBlocks - 1))) ||
+      (Header->AlternateLBA <= EntryBlocks))
+  {
+    return FALSE;
+  }
+
+  SafeStatus = SafeUintnMult ((UINTN)EntryBlocks, BlockSize, EntrySpanSize);
+  if (RETURN_ERROR (SafeStatus) || (*EntrySpanSize < *EntriesSize)) {
+    return FALSE;
+  }
+
+  *BackupEntryLba = Header->AlternateLBA - EntryBlocks;
+  return TRUE;
+}
+
+STATIC
+EFI_STATUS
+ReadPrimaryGptHeader (
+  IN  EFI_DISK_IO_PROTOCOL         *DiskIo,
+  IN  EFI_BLOCK_IO_PROTOCOL        *BlockIo,
+  OUT EFI_PARTITION_TABLE_HEADER   *Header,
+  OUT UINTN                        *EntriesSize,
+  OUT UINTN                        *EntrySpanSize,
+  OUT EFI_LBA                      *BackupEntryLba
+  )
+{
+  EFI_STATUS  Status;
+
+  if ((DiskIo == NULL) || (BlockIo == NULL) || (Header == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Status = DiskIo->ReadDisk (
+                     DiskIo,
+                     BlockIo->Media->MediaId,
+                     MultU64x32 (PRIMARY_PART_HEADER_LBA, BlockIo->Media->BlockSize),
+                     sizeof (*Header),
+                     Header
+                     );
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  if (!GetGptEntryLayout (BlockIo, Header, EntriesSize, EntrySpanSize, BackupEntryLba)) {
+    return EFI_VOLUME_CORRUPTED;
+  }
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+UINTN
+CountGptPartitions (
+  IN CONST EFI_PARTITION_TABLE_HEADER  *Header,
+  IN CONST VOID                        *Entries
+  )
+{
+  UINTN  PartitionCount;
+
+  PartitionCount = 0;
+  for (UINTN Index = 0; Index < Header->NumberOfPartitionEntries; Index++) {
+    CONST EFI_PARTITION_ENTRY  *Entry;
+
+    Entry = (CONST EFI_PARTITION_ENTRY *)((CONST UINT8 *)Entries + (Index * Header->SizeOfPartitionEntry));
+    if (!IsZeroGuid (&Entry->PartitionTypeGUID)) {
+      PartitionCount++;
+    }
+  }
+
+  return PartitionCount;
+}
+
+STATIC
+EFI_STATUS
+ParseDiskIndexArg (
+  IN  CONST CHAR16  *Value,
+  OUT UINTN         *DiskIndex
+  )
+{
+  RETURN_STATUS  ParseStatus;
+  CHAR16         *EndPointer;
+
+  if ((Value == NULL) || (Value[0] == L'\0') || (DiskIndex == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  EndPointer = NULL;
+  ParseStatus = StrDecimalToUintnS (Value, &EndPointer, DiskIndex);
+  if (RETURN_ERROR (ParseStatus) || (EndPointer == Value) || (*EndPointer != L'\0')) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  return EFI_SUCCESS;
+}
+
+STATIC
 DISK_TYPE
 DetectDiskType (
   IN EFI_BLOCK_IO_PROTOCOL  *BlockIo,
   IN EFI_DISK_IO_PROTOCOL   *DiskIo
   )
 {
-  EFI_STATUS  Status;
-  MBR_TABLE   Mbr;
+  EFI_STATUS                  Status;
+  MBR_TABLE                   Mbr;
+  EFI_PARTITION_TABLE_HEADER  Header;
+  UINTN                       EntriesSize;
+  UINTN                       EntrySpanSize;
+  EFI_LBA                     BackupEntryLba;
 
-  if (!BlockIo->Media->MediaPresent || BlockIo->Media->BlockSize < 512) {
+  if (!IsWholeDiskDevice (BlockIo)) {
     return DiskTypeUnknown;
   }
 
@@ -242,16 +401,17 @@ DetectDiskType (
   }
 
   if (Mbr.Signature == MBR_SIGNATURE) {
-    return (Mbr.Partitions[0].PartitionType == 0xEE) ? DiskTypeGpt : DiskTypeMbr;
+    if (Mbr.Partitions[0].PartitionType == 0xEE) {
+      Status = ReadPrimaryGptHeader (DiskIo, BlockIo, &Header, &EntriesSize, &EntrySpanSize, &BackupEntryLba);
+      return EFI_ERROR (Status) ? DiskTypeUnknown : DiskTypeGpt;
+    }
+
+    return DiskTypeMbr;
   }
 
-  {
-    EFI_PARTITION_TABLE_HEADER  Header;
-
-    Status = DiskIo->ReadDisk (DiskIo, BlockIo->Media->MediaId, 1 * BlockIo->Media->BlockSize, sizeof (Header), &Header);
-    if (!EFI_ERROR (Status) && Header.Header.Signature == EFI_PTAB_HEADER_ID) {
-      return DiskTypeGpt;
-    }
+  Status = ReadPrimaryGptHeader (DiskIo, BlockIo, &Header, &EntriesSize, &EntrySpanSize, &BackupEntryLba);
+  if (!EFI_ERROR (Status)) {
+    return DiskTypeGpt;
   }
 
   return DiskTypeUnknown;
@@ -385,38 +545,65 @@ GetDiskSizeStr (
 
 STATIC
 EFI_STATUS
+ClearMBR (
+  IN EFI_DISK_IO_PROTOCOL  *DiskIo,
+  IN EFI_BLOCK_IO_PROTOCOL *BlockIo
+  );
+
+// Wipe all GPT metadata so the disk is left fully unpartitioned.
+STATIC
+EFI_STATUS
 ClearGPT (
   IN EFI_DISK_IO_PROTOCOL        *DiskIo,
   IN EFI_BLOCK_IO_PROTOCOL       *BlockIo,
-  IN EFI_PARTITION_TABLE_HEADER  *Header
+  IN EFI_PARTITION_TABLE_HEADER  *Header,
+  IN UINTN                       EntrySpanSize,
+  IN EFI_LBA                     BackupEntryLba
   )
 {
   EFI_STATUS  Status;
   UINTN       BlockSize;
-  UINTN       EntriesSize;
   UINT8       *ZeroBuffer;
-  UINT64      BackupLBA;
 
   BlockSize   = (UINTN)BlockIo->Media->BlockSize;
-  EntriesSize = (UINTN)Header->NumberOfPartitionEntries * (UINTN)Header->SizeOfPartitionEntry;
-  ASSERT (EntriesSize <= MAX_GPT_ENTRIES_SIZE);
 
-  ZeroBuffer = AllocateZeroPool (EntriesSize);
+  ZeroBuffer = AllocateZeroPool (EntrySpanSize);
   if (ZeroBuffer == NULL) {
     return EFI_OUT_OF_RESOURCES;
   }
 
+  // Wipe the full first block so no MBR signature or protective entry remains.
+  Status = ClearMBR (DiskIo, BlockIo);
+  if (EFI_ERROR (Status)) { goto Done; }
+
   Status = DiskIo->WriteDisk (DiskIo, BlockIo->Media->MediaId, 1 * BlockSize, BlockSize, ZeroBuffer);
   if (EFI_ERROR (Status)) { goto Done; }
 
-  Status = DiskIo->WriteDisk (DiskIo, BlockIo->Media->MediaId, Header->PartitionEntryLBA * BlockSize, EntriesSize, ZeroBuffer);
+  Status = DiskIo->WriteDisk (
+                     DiskIo,
+                     BlockIo->Media->MediaId,
+                     MultU64x32 (Header->PartitionEntryLBA, BlockIo->Media->BlockSize),
+                     EntrySpanSize,
+                     ZeroBuffer
+                     );
   if (EFI_ERROR (Status)) { goto Done; }
 
-  BackupLBA = Header->AlternateLBA - Header->NumberOfPartitionEntries;
-  Status = DiskIo->WriteDisk (DiskIo, BlockIo->Media->MediaId, BackupLBA * BlockSize, EntriesSize, ZeroBuffer);
+  Status = DiskIo->WriteDisk (
+                     DiskIo,
+                     BlockIo->Media->MediaId,
+                     MultU64x32 (BackupEntryLba, BlockIo->Media->BlockSize),
+                     EntrySpanSize,
+                     ZeroBuffer
+                     );
   if (EFI_ERROR (Status)) { goto Done; }
 
-  Status = DiskIo->WriteDisk (DiskIo, BlockIo->Media->MediaId, Header->AlternateLBA * BlockSize, BlockSize, ZeroBuffer);
+  Status = DiskIo->WriteDisk (
+                     DiskIo,
+                     BlockIo->Media->MediaId,
+                     MultU64x32 (Header->AlternateLBA, BlockIo->Media->BlockSize),
+                     BlockSize,
+                     ZeroBuffer
+                     );
   if (EFI_ERROR (Status)) { goto Done; }
 
   Status = BlockIo->FlushBlocks (BlockIo);
@@ -435,25 +622,26 @@ ClearMBR (
 {
   EFI_STATUS  Status;
   UINTN       BlockSize;
-  UINT8       *Buf;
+  UINT8       *ZeroBuffer;
 
-  BlockSize = (UINTN)BlockIo->Media->BlockSize;
-  Buf       = AllocateZeroPool (BlockSize);
-  if (Buf == NULL) {
+  if (!IsWholeDiskDevice (BlockIo)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  BlockSize  = (UINTN)BlockIo->Media->BlockSize;
+  ZeroBuffer = AllocateZeroPool (BlockSize);
+  if (ZeroBuffer == NULL) {
     return EFI_OUT_OF_RESOURCES;
   }
 
-  Status = DiskIo->ReadDisk (DiskIo, BlockIo->Media->MediaId, 0, BlockSize, Buf);
-  if (EFI_ERROR (Status)) { goto Done; }
-
-  SetMem (Buf + MBR_PARTITION_OFFSET, MBR_PARTITION_SIZE * MBR_PARTITION_COUNT, 0);
-  Status = DiskIo->WriteDisk (DiskIo, BlockIo->Media->MediaId, 0, BlockSize, Buf);
+  // Zero the entire first block rather than preserving a blank MBR shell.
+  Status = DiskIo->WriteDisk (DiskIo, BlockIo->Media->MediaId, 0, BlockSize, ZeroBuffer);
   if (EFI_ERROR (Status)) { goto Done; }
 
   Status = BlockIo->FlushBlocks (BlockIo);
 
 Done:
-  FreePool (Buf);
+  FreePool (ZeroBuffer);
   return Status;
 }
 
@@ -565,6 +753,7 @@ ScanDisks (
     BlockIo = NULL;
     Status = gBS->HandleProtocol (Handles[i], &gEfiBlockIoProtocolGuid, (VOID **)&BlockIo);
     if (EFI_ERROR (Status) || BlockIo == NULL) { continue; }
+    if (!IsWholeDiskDevice (BlockIo)) { continue; }
 
     DiskIo = NULL;
     Status = gBS->HandleProtocol (Handles[i], &gEfiDiskIoProtocolGuid, (VOID **)&DiskIo);
@@ -577,7 +766,7 @@ ScanDisks (
     Info[Count].DiskIo     = DiskIo;
     Info[Count].DevicePath = DevicePath;
     Info[Count].Handle     = Handles[i];
-    Info[Count].DiskIndex  = i;
+    Info[Count].DiskIndex  = Count;
     Info[Count].DiskType   = DetectDiskType (BlockIo, DiskIo);
     Info[Count].WillProcess = TRUE;
 
@@ -598,22 +787,35 @@ ScanDisks (
       }
     } else if (Info[Count].DiskType == DiskTypeGpt) {
       EFI_PARTITION_TABLE_HEADER  Header;
-      Status = DiskIo->ReadDisk (DiskIo, BlockIo->Media->MediaId, 1 * BlockIo->Media->BlockSize, sizeof (Header), &Header);
-      if (!EFI_ERROR (Status) && Header.Header.Signature == EFI_PTAB_HEADER_ID && Header.MyLBA == 1) {
-        UINTN EntriesSize = (UINTN)Header.NumberOfPartitionEntries * (UINTN)Header.SizeOfPartitionEntry;
-        if (EntriesSize <= MAX_GPT_ENTRIES_SIZE && EntriesSize > 0) {
-          EFI_PARTITION_ENTRY *Entries = AllocatePool (EntriesSize);
-          if (Entries != NULL) {
-            Status = DiskIo->ReadDisk (DiskIo, BlockIo->Media->MediaId, Header.PartitionEntryLBA * BlockIo->Media->BlockSize, EntriesSize, Entries);
-            if (!EFI_ERROR (Status)) {
-              for (UINTN p = 0; p < Header.NumberOfPartitionEntries; p++) {
-                if (!IsZeroGuid (&Entries[p].PartitionTypeGUID)) {
-                  Info[Count].PartitionCount++;
-                }
-              }
-            }
-            FreePool (Entries);
+      UINTN                       EntriesSize;
+      UINTN                       EntrySpanSize;
+      EFI_LBA                     BackupEntryLba;
+
+      Status = ReadPrimaryGptHeader (
+                 DiskIo,
+                 BlockIo,
+                 &Header,
+                 &EntriesSize,
+                 &EntrySpanSize,
+                 &BackupEntryLba
+                 );
+      if (!EFI_ERROR (Status)) {
+        VOID  *Entries;
+
+        Entries = AllocatePool (EntriesSize);
+        if (Entries != NULL) {
+          Status = DiskIo->ReadDisk (
+                             DiskIo,
+                             BlockIo->Media->MediaId,
+                             MultU64x32 (Header.PartitionEntryLBA, BlockIo->Media->BlockSize),
+                             EntriesSize,
+                             Entries
+                             );
+          if (!EFI_ERROR (Status)) {
+            Info[Count].PartitionCount = CountGptPartitions (&Header, Entries);
           }
+
+          FreePool (Entries);
         }
       }
     }
@@ -634,7 +836,6 @@ VOID
 ApplyDiskChanges (
   IN DISK_SCAN_INFO  *Info,
   IN UINTN           DiskCount,
-  IN CONST TARGET_LIST *Targets,
   IN BOOLEAN         DryRun,
   OUT UINTN          *Processed,
   OUT UINTN          *Skipped,
@@ -676,12 +877,23 @@ ApplyDiskChanges (
     if (Disk->DiskType == DiskTypeMbr) {
       ClearStatus = ClearMBR (Disk->DiskIo, Disk->BlockIo);
     } else {
-      EFI_PARTITION_TABLE_HEADER Header;
-      Status = Disk->DiskIo->ReadDisk (Disk->DiskIo, Disk->BlockIo->Media->MediaId, 1 * Disk->BlockIo->Media->BlockSize, sizeof (Header), &Header);
-      if (!EFI_ERROR (Status) && Header.Header.Signature == EFI_PTAB_HEADER_ID) {
-        ClearStatus = ClearGPT (Disk->DiskIo, Disk->BlockIo, &Header);
+      EFI_PARTITION_TABLE_HEADER  Header;
+      UINTN                       DummyEntriesSize;
+      UINTN                       EntrySpanSize;
+      EFI_LBA                     BackupEntryLba;
+
+      Status = ReadPrimaryGptHeader (
+                 Disk->DiskIo,
+                 Disk->BlockIo,
+                 &Header,
+                 &DummyEntriesSize,
+                 &EntrySpanSize,
+                 &BackupEntryLba
+                 );
+      if (!EFI_ERROR (Status)) {
+        ClearStatus = ClearGPT (Disk->DiskIo, Disk->BlockIo, &Header, EntrySpanSize, BackupEntryLba);
       } else {
-        ClearStatus = EFI_INVALID_PARAMETER;
+        ClearStatus = Status;
       }
     }
 
@@ -721,7 +933,9 @@ MainCmdDvol (
   TARGET_LIST     Targets;
   DISK_SCAN_INFO  *ScanInfo;
   UINTN           DiskCount;
+  UINTN           ProcessCount;
 
+  (VOID)ImageHandle;
   DiskCount = 0;
   ProcessedDisks     = 0;
   MbrPartitionsDeleted  = 0;
@@ -736,7 +950,6 @@ MainCmdDvol (
     LogPath = ShellCommandLineGetValue (Package, L"--output");
   }
 
-  // Parse flags
   if (ShellCommandLineGetFlag (Package, L"-y") || ShellCommandLineGetFlag (Package, L"--yes")) {
     AutoConfirm = TRUE;
   }
@@ -752,20 +965,35 @@ MainCmdDvol (
     LogWriteCrLf (L"  -y, --yes              Skip confirmation prompt");
     LogWriteCrLf (L"  -n, --dry-run          Scan only, do NOT write to disk");
     LogWriteCrLf (L"  -r, --removable        Include removable media (USB, SD, etc.)");
-    LogWriteCrLf (L"  -d <N>, --disk <N>     Target specific disk by scan index");
-    LogWriteCrLf (L"  -o <PATH>, --output <PATH>  Export log to FAT file (e.g., fs0:\\log.txt)");
+    LogWriteCrLf (L"  -d <N>, --disk <N>     Target specific scan index");
+    LogWriteCrLf (L"  -o <PATH>, --output <PATH>  Export log (e.g., fs0:\\log.txt)");
     LogWriteCrLf (L"  -h, --help             Show this help message and exit");
     return SHELL_SUCCESS;
   }
 
-  // Collect -d targets
   {
-    CONST CHAR16 *DiskVal;
+    CONST CHAR16  *DiskVal;
 
     DiskVal = ShellCommandLineGetValue (Package, L"-d");
-    while (DiskVal != NULL && Targets.TargetCount < MAX_TARGET_DISKS) {
-      Targets.TargetArray[Targets.TargetCount++] = StrDecimalToUintn (DiskVal);
+    if (DiskVal == NULL) {
       DiskVal = ShellCommandLineGetValue (Package, L"--disk");
+    }
+
+    if (DiskVal != NULL) {
+      UINTN  DiskIndex;
+
+      if (Targets.TargetCount >= MAX_TARGET_DISKS) {
+        LogPrintf (L"ERROR: Too many -d arguments (max %u).\r\n", MAX_TARGET_DISKS);
+        return SHELL_INVALID_PARAMETER;
+      }
+
+      Status = ParseDiskIndexArg (DiskVal, &DiskIndex);
+      if (EFI_ERROR (Status)) {
+        LogPrintf (L"ERROR: Invalid disk index '%s'.\r\n", DiskVal);
+        return SHELL_INVALID_PARAMETER;
+      }
+
+      Targets.TargetArray[Targets.TargetCount++] = DiskIndex;
     }
   }
 
@@ -834,7 +1062,7 @@ MainCmdDvol (
   }
 
   // Count how many will be processed
-  UINTN ProcessCount = 0;
+  ProcessCount = 0;
   for (UINTN i = 0; i < DiskCount; i++) {
     if (ScanInfo[i].WillProcess) { ProcessCount++; }
   }
@@ -853,9 +1081,18 @@ MainCmdDvol (
     {
       EFI_EVENT   WaitList[1];
       EFI_INPUT_KEY Key;
+      UINTN         EventIndex;
 
       WaitList[0] = gST->ConIn->WaitForKey;
-      gBS->WaitForEvent (1, WaitList, NULL);
+      EventIndex  = 0;
+      Status = gBS->WaitForEvent (1, WaitList, &EventIndex);
+      if (EFI_ERROR (Status) || (EventIndex != 0)) {
+        LogPrintf (L"\r\nFailed to read confirmation key (%r).\r\n", Status);
+        CloseLogFile ();
+        FreePool (ScanInfo);
+        return SHELL_DEVICE_ERROR;
+      }
+
       Status = gST->ConIn->ReadKeyStroke (gST->ConIn, &Key);
 
       if (EFI_ERROR (Status) || (Key.UnicodeChar != L'Y' && Key.UnicodeChar != L'y')) {
@@ -876,7 +1113,7 @@ MainCmdDvol (
   LogWriteCrLf (L"");
   ApplyDiskChanges (
     ScanInfo, DiskCount,
-    &Targets, DryRun,
+    DryRun,
     &ProcessedDisks, &SkippedDisks,
     &MbrPartitionsDeleted, &GptPartitionsDeleted
   );

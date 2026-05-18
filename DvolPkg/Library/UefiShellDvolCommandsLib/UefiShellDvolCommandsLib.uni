@@ -1,0 +1,41 @@
+// /**
+//
+// Copyright (c) 2026. All rights reserved.
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+//
+// Module Name:
+//
+// UefiShellDvolCommandsLib.uni
+//
+// Abstract:
+//
+// String definitions for the dvol shell command.
+//
+// **/
+
+/=#
+
+#langdef   en-US "english"
+
+#string STR_GET_HELP_DVOL   #language en-US ""
+".TH dvol 0 \"wipe disk partition tables\"\r\n"
+".SH NAME\r\n"
+"Deletes MBR and GPT partitions on non-removable disks.\r\n"
+".SH SYNOPSIS\r\n"
+" \r\n"
+"dvol [-y|--yes] [-n|--dry-run] [-r|--removable] [-d N|--disk N] [-o PATH|--output PATH]\r\n"
+".SH OPTIONS\r\n"
+" \r\n"
+"  -y, --yes          Skip the confirmation prompt.\r\n"
+"  -n, --dry-run      Scan disks without writing changes.\r\n"
+"  -r, --removable    Include removable media in the scan.\r\n"
+"  -d, --disk         Limit the operation to a specific scan index.\r\n"
+"  -o, --output       Write a UTF-16 log file to the specified shell path.\r\n"
+".SH DESCRIPTION\r\n"
+" \r\n"
+"This command scans whole-disk block devices, shows their partitioning state,\r\n"
+"and removes MBR or GPT partition metadata from the selected targets.\r\n"
+".SH EXAMPLES\r\n"
+" \r\n"
+"  Shell> dvol --dry-run\r\n"
+"  Shell> dvol --disk 0 --yes\r\n"

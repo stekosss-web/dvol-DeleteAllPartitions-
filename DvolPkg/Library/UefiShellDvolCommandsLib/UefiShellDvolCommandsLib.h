@@ -13,6 +13,7 @@
 #include <Library/BaseMemoryLib.h>
 #include <Library/MemoryAllocationLib.h>
 #include <Library/DebugLib.h>
+#include <Library/HiiLib.h>
 #include <Library/PrintLib.h>
 #include <Library/ShellCommandLib.h>
 #include <Library/ShellLib.h>
@@ -30,6 +31,20 @@
 SHELL_STATUS
 EFIAPI
 ShellCommandRunDvol (
+  IN EFI_HANDLE        ImageHandle,
+  IN EFI_SYSTEM_TABLE  *SystemTable
+  );
+
+EFI_STATUS
+EFIAPI
+ShellDvolCommandsLibConstructor (
+  IN EFI_HANDLE        ImageHandle,
+  IN EFI_SYSTEM_TABLE  *SystemTable
+  );
+
+EFI_STATUS
+EFIAPI
+ShellDvolCommandsLibDestructor (
   IN EFI_HANDLE        ImageHandle,
   IN EFI_SYSTEM_TABLE  *SystemTable
   );
